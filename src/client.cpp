@@ -1,48 +1,74 @@
+// src/echo_client.cpp
 #include <iostream>
 #include <string>
-#include "ipc/file_socket.cpp"
+#include "protocol/protocol.hpp"
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+int get_session_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return getpid();
+#endif
+}
 
 int main() {
-    std::cout << "Starting Echo Client..." << std::endl;
+    int session_id = get_session_id();
+    std::cout << "Starting Echo Client. Session ID: " << session_id << std::endl;
     
     while (true) {
-        std::cout << "Enter message (or 'quit'): ";
-        std::string message;
-        std::getline(std::cin, message);
+        std::cout << "\nEnter command (start/letter/quit): ";
+        std::string input;
+        std::getline(std::cin, input);
         
-        if (message == "quit") break;
+        if (input == "quit") {
+            break;
+        }
         
-        FileSocket::clear_messages(IPC::SOCKET_FILE);
+        // Очищаем файл перед отправкой нового сообщения
+        Protocol::clear_messages();
         
-        if (FileSocket::write_message(IPC::SOCKET_FILE, message)) {
-            std::cout << "Sent: " << message << std::endl;
+        bool success = false;
+        
+        if (input == "start") {
+            std::cout << "Sending PING start..." << std::endl;
+            success = Protocol::send_ping_start(session_id);
+        } else if (input.length() == 1) {
+            std::cout << "Sending PING with letter: " << input[0] << std::endl;
+            success = Protocol::send_ping_guess(session_id, input[0]);
         } else {
+            std::cout << "Invalid input. Use 'start', single letter, or 'quit'" << std::endl;
+            continue;
+        }
+        
+        if (!success) {
             std::cout << "Failed to send message" << std::endl;
             continue;
         }
         
-        bool response_received = false;
-        auto start = std::chrono::steady_clock::now();
+        std::cout << "Waiting for PONG response..." << std::endl;
         
-        while (!response_received) {
-            auto responses = FileSocket::read_messages(IPC::SOCKET_FILE);
+        // Ждем PONG ответ
+        auto response = Protocol::wait_for_pong(session_id, 5000);
+        
+        if (!response.message_type.empty()) {
+            std::cout << "Received PONG!" << std::endl;
+            std::cout << "  Game state: " << response.game_state << std::endl;
+            std::cout << "  Errors left: " << response.errors_left << std::endl;
+            std::cout << "  Status: " << response.status << std::endl;
+            std::cout << "  Additional: " << response.additional_info << std::endl;
             
-            for (const auto& response : responses) {
-                if (response.find("ECHO: " + message) == 0) {
-                    std::cout << "Received: " << response << std::endl;
-                    response_received = true;
-                    break;
-                }
-            }
+            Protocol::clear_messages();// ОЧИЩАЕМ файл после успешного получения PONG
+            // Это подтверждает что мы получили ответ и готовы к следующему сообщению
+        } else {
+            std::cout << "No PONG response received (timeout)" << std::endl;
+            // При таймауте тоже очищаем, чтобы не копился мусор
             
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-            if (elapsed > 3000) { 
-                std::cout << "Timeout waiting for response" << std::endl;
-                break;
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
     

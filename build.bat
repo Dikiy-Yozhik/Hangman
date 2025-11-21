@@ -1,16 +1,12 @@
 @echo off
 set CXX=g++
-set CFLAGS=-Wall -Wextra -std=c++11
+set CFLAGS=-Wall -Wextra -std=c++17
 
-echo Building echo server...
-%CXX% %CFLAGS% -o server.exe src/server.cpp
+echo Building echo server with protocol...
+%CXX% %CFLAGS% -o server.exe src/server.cpp src/protocol/protocol.cpp src/ipc/file_socket.cpp
 
-echo Building echo client...
-%CXX% %CFLAGS% -o client.exe src/client.cpp
+echo Building echo client with protocol...
+%CXX% %CFLAGS% -o client.exe src/client.cpp src/protocol/protocol.cpp src/ipc/file_socket.cpp
 
 echo Build complete!
 echo.
-echo To test:
-echo  1. Run server_basic.exe in one terminal
-echo  2. Run client_basic.exe in another terminal
-echo  3. Type messages in client
