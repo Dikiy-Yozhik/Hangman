@@ -1,0 +1,12 @@
+programming
+computer
+algorithm
+database
+network
+security
+developer
+hangman
+windows
+linux
+python
+javascript
