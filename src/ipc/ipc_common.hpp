@@ -19,7 +19,7 @@ namespace IPC {
     const int RETRY_DELAY_MS = 100;
     
     // Константы для бинарного протокола
-    const int BINARY_HEADER_SIZE = 20;  // sizeof(MessageHeader) с выравниванием
+    const int BINARY_HEADER_SIZE = 20;  
     const int MAX_PAYLOAD_SIZE = MAX_MESSAGE_SIZE - BINARY_HEADER_SIZE;
     
     // Вспомогательные функции
@@ -29,7 +29,7 @@ namespace IPC {
     
     inline uint32_t get_session_file_offset(uint32_t session_id) {
         if (!is_valid_session_id(session_id)) {
-            return FILE_HEADER_SIZE; // fallback to first session
+            return FILE_HEADER_SIZE; 
         }
         return FILE_HEADER_SIZE + (session_id % MAX_SESSIONS) * SESSION_REGION_SIZE;
     }
@@ -49,4 +49,4 @@ namespace IPC {
     }
 }
 
-#endif // IPC_COMMON_HPP
+#endif 
