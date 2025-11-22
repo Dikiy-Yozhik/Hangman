@@ -1,8 +1,12 @@
-// src/game_client.cpp
 #include <iostream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <random>
+#include <thread>
+#include <functional>
+#include <cstdint>
 #include "protocol/protocol.hpp"
 
 #ifdef _WIN32
@@ -11,23 +15,70 @@
 #include <unistd.h>
 #endif
 
-int get_session_id() {
+uint32_t get_session_id() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<uint32_t> dis;
+    
+    auto now = std::chrono::steady_clock::now();
+    auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    
+    // Комбинируем timestamp и случайное число
+    return (static_cast<uint32_t>(time_ms) & 0xFFFF0000) | (dis(gen) & 0x0000FFFF);
+}
+
+void sleep_ms(int milliseconds) {
 #ifdef _WIN32
-    return GetCurrentProcessId();
+    Sleep(milliseconds);
 #else
-    return getpid();
+    usleep(milliseconds * 1000);
 #endif
 }
 
 class GameClient {
 private:
-    int session_id_;
+    uint32_t session_id_;
+    uint32_t sequence_number_;
     std::vector<char> guessed_letters_;
+    const int OPERATION_TIMEOUT_MS = 10000; // 10 секунд
+    const int CONNECTION_RETRIES = 3;
     
 public:
-    GameClient() : session_id_(get_session_id()) {}
+    GameClient() : session_id_(get_session_id()), sequence_number_(1) {}
     
-    void display_game_state(const Protocol::ParsedMessage& response) {
+    void display_binary_game_state(const Protocol::GameState& game_state) {
+        std::cout << "\n=== HANGMAN GAME ===" << std::endl;
+        std::cout << "Word: " << game_state.display_word << std::endl;
+        std::cout << "Errors left: " << static_cast<int>(game_state.errors_left) << "/6" << std::endl;
+        
+        // Конвертируем статус в строку
+        std::string status_str;
+        switch (game_state.status) {
+            case Protocol::GameStatus::IN_PROGRESS: status_str = "IN_PROGRESS"; break;
+            case Protocol::GameStatus::WIN: status_str = "WIN"; break;
+            case Protocol::GameStatus::LOSE: status_str = "LOSE"; break;
+            case Protocol::GameStatus::ERROR_STATE: status_str = "ERROR"; break;
+            default: status_str = "UNKNOWN";
+        }
+        
+        std::cout << "Status: " << status_str << std::endl;
+        
+        if (!game_state.additional_info.empty()) {
+            std::cout << "Info: " << game_state.additional_info << std::endl;
+        }
+        
+        if (!guessed_letters_.empty()) {
+            std::cout << "Guessed letters: ";
+            for (char letter : guessed_letters_) {
+                std::cout << letter << " ";
+            }
+            std::cout << std::endl;
+        }
+        std::cout << "====================" << std::endl;
+    }
+    
+    void display_parsed_game_state(const Protocol::ParsedMessage& response) {
         std::cout << "\n=== HANGMAN GAME ===" << std::endl;
         std::cout << "Word: " << response.game_state << std::endl;
         std::cout << "Errors left: " << response.errors_left << "/6" << std::endl;
@@ -49,9 +100,10 @@ public:
     
     void play_game() {
         std::cout << "Welcome to Hangman! Session ID: " << session_id_ << std::endl;
+        std::cout << "Using binary protocol..." << std::endl;
         
         // Начинаем игру
-        if (!start_new_game()) {
+        if (!start_new_game_binary()) {
             std::cout << "Failed to start game!" << std::endl;
             return;
         }
@@ -84,7 +136,7 @@ public:
             }
             
             // Отправляем букву на сервер
-            if (!make_guess(letter)) {
+            if (!make_guess_binary(letter)) {
                 std::cout << "Game session ended." << std::endl;
                 break;
             }
@@ -92,58 +144,154 @@ public:
     }
     
 private:
-    bool start_new_game() {
-        Protocol::clear_messages();
+    bool start_new_game_binary() {
+        for (int attempt = 0; attempt < CONNECTION_RETRIES; ++attempt) {
+            Protocol::clear_messages();
+            
+            std::cout << "Starting new game (attempt " << (attempt + 1) << ")..." << std::endl;
+            
+            // Используем бинарный протокол
+            if (!Protocol::send_binary_ping(session_id_, sequence_number_++, "start")) {
+                std::cout << "Failed to send start request!" << std::endl;
+                if (attempt < CONNECTION_RETRIES - 1) {
+                    sleep_ms(1000 * (attempt + 1));
+                    continue;
+                }
+                return false;
+            }
+            
+            // Ждем ответ с таймаутом
+            auto binary_response = Protocol::receive_binary_message(session_id_, OPERATION_TIMEOUT_MS);
+
+            std::cout << "DEBUG: Client received response - session_id: " << binary_response.header.session_id 
+                    << ", message_type: " << binary_response.header.message_type << std::endl;
+
+            if (binary_response.header.session_id != 0) {
+                if (binary_response.header.message_type == Protocol::MessageType::PONG) {
+                    auto game_state = Protocol::parse_pong_payload(binary_response.payload);
+                    
+                    if (game_state.status == Protocol::GameStatus::ERROR_STATE) {
+                        std::cout << "Server error: " << game_state.additional_info << std::endl;
+                        return false;
+                    }
+                    
+                    display_binary_game_state(game_state);
+                    guessed_letters_.clear();
+                    return true;
+                }
+            } else {
+                std::cout << "DEBUG: No valid response received" << std::endl;
+            }
+            
+            std::cout << "No response from server, retrying..." << std::endl;
+            if (attempt < CONNECTION_RETRIES - 1) {
+                sleep_ms(1000 * (attempt + 1));
+            }
+        }
         
-        std::cout << "Starting new game..." << std::endl;
-        if (!Protocol::send_ping_start(session_id_)) {
-            std::cout << "Failed to send start request!" << std::endl;
+        std::cout << "Failed to start game after " << CONNECTION_RETRIES << " attempts" << std::endl;
+        return false;
+    }
+    
+    bool make_guess_binary(char letter) {
+        std::string letter_str(1, letter);
+        
+        if (!Protocol::send_binary_ping(session_id_, sequence_number_++, letter_str)) {
+            std::cout << "Failed to send guess!" << std::endl;
             return false;
         }
         
-        std::cout << "Waiting for game to start..." << std::endl;
-        auto response = Protocol::wait_for_pong(session_id_, 5000);
+        auto binary_response = Protocol::receive_binary_message(session_id_, OPERATION_TIMEOUT_MS);
         
-        if (response.message_type.empty()) {
+        if (binary_response.header.session_id == 0) {
             std::cout << "No response from server!" << std::endl;
             return false;
         }
         
-        if (response.status == "ERROR") {
-            std::cout << "Server error: " << response.additional_info << std::endl;
-            return false;
+        if (binary_response.header.message_type == Protocol::MessageType::PONG) {
+            auto game_state = Protocol::parse_pong_payload(binary_response.payload);
+            display_binary_game_state(game_state);
+            
+            // Проверяем завершение игры
+            if (game_state.status == Protocol::GameStatus::WIN || 
+                game_state.status == Protocol::GameStatus::LOSE) {
+                
+                std::cout << "\n*** GAME OVER ***" << std::endl;
+                if (game_state.status == Protocol::GameStatus::WIN) {
+                    std::cout << "🎉 Congratulations! You won! 🎉" << std::endl;
+                } else {
+                    std::cout << "💀 Game over! Better luck next time! 💀" << std::endl;
+                }
+                
+                std::cout << "\nPlay again? (y/n): ";
+                std::string choice;
+                std::getline(std::cin, choice);
+                
+                if (choice == "y" || choice == "Y") {
+                    sequence_number_ = 1; // Сбрасываем sequence для новой игры
+                    return start_new_game_binary();
+                } else {
+                    return false;
+                }
+            }
         }
         
-        display_game_state(response);
-        guessed_letters_.clear(); // Очищаем историю для новой игры
-        
-        Protocol::clear_messages();
         return true;
     }
     
-    bool make_guess(char letter) {
-        Protocol::clear_messages();
+    // Старые методы для обратной совместимости (можно удалить после тестирования)
+    bool start_new_game() {
+        for (int attempt = 0; attempt < CONNECTION_RETRIES; ++attempt) {
+            Protocol::clear_messages();
+            
+            std::cout << "Starting new game (attempt " << (attempt + 1) << ")..." << std::endl;
+            if (!Protocol::send_ping_start(session_id_)) {
+                std::cout << "Failed to send start request!" << std::endl;
+                if (attempt < CONNECTION_RETRIES - 1) {
+                    sleep_ms(1000 * (attempt + 1));
+                    continue;
+                }
+                return false;
+            }
+            
+            auto response = Protocol::wait_for_pong(session_id_, OPERATION_TIMEOUT_MS);
+            
+            if (!response.message_type.empty()) {
+                if (response.status == "ERROR") {
+                    std::cout << "Server error: " << response.additional_info << std::endl;
+                    return false;
+                }
+                
+                display_parsed_game_state(response);
+                guessed_letters_.clear();
+                return true;
+            }
+            
+            std::cout << "No response from server, retrying..." << std::endl;
+        }
         
+        std::cout << "Failed to start game after " << CONNECTION_RETRIES << " attempts" << std::endl;
+        return false;
+    }
+    
+    bool make_guess(char letter) {
         if (!Protocol::send_ping_guess(session_id_, letter)) {
             std::cout << "Failed to send guess!" << std::endl;
             return false;
         }
         
-        auto response = Protocol::wait_for_pong(session_id_, 5000);
+        auto response = Protocol::wait_for_pong(session_id_, OPERATION_TIMEOUT_MS);
         
         if (response.message_type.empty()) {
             std::cout << "No response from server!" << std::endl;
             return false;
         }
         
-        display_game_state(response);
+        display_parsed_game_state(response);
         
-        // Проверяем завершение игры
-        if (response.status == Protocol::GameStatus::WIN || 
-            response.status == Protocol::GameStatus::LOSE) {
-            
+        if (response.status == "WIN" || response.status == "LOSE") {
             std::cout << "\n*** GAME OVER ***" << std::endl;
-            if (response.status == Protocol::GameStatus::WIN) {
+            if (response.status == "WIN") {
                 std::cout << "🎉 Congratulations! You won! 🎉" << std::endl;
             } else {
                 std::cout << "💀 Game over! Better luck next time! 💀" << std::endl;
@@ -160,7 +308,6 @@ private:
             }
         }
         
-        Protocol::clear_messages();
         return true;
     }
 };
